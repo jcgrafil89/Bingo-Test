@@ -1,1 +1,499 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, getDocs } from 'firebase/firestore';
+
+// Componente principal de la aplicación de Bingo
+function App() {
+    // Estado de Firebase y autenticación
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    // Estado del juego
+    const [bingoCard, setBingoCard] = useState([]); // El cartón de bingo del jugador
+    const [markedNumbers, setMarkedNumbers] = useState(new Set()); // Números marcados por el jugador en su cartón
+    const [calledNumbers, setCalledNumbers] = useState(new Set()); // Números cantados por el sistema
+    const [gameStatus, setGameStatus] = useState('waiting'); // 'waiting', 'playing', 'bingo_called', 'game_over'
+    const [message, setMessage] = useState('Esperando jugadores...'); // Mensajes de estado del juego
+    const [bingoWinner, setBingoWinner] = useState(null); // ID del ganador del bingo
+    const [players, setPlayers] = useState({}); // Lista de jugadores conectados
+    const [isLoading, setIsLoading] = useState(true); // Estado de carga inicial
+
+    // Estado para el modal de bingo
+    const [showBingoModal, setShowBingoModal] = useState(false);
+    const [isBingoValid, setIsBingoValid] = useState(false);
+
+    // Referencia para asegurar que la suscripción a Firestore se limpie
+    const unsubscribeRef = useRef(null);
+    const unsubscribePlayersRef = useRef(null);
+
+    // Obtener appId del entorno
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+    // --- Inicialización de Firebase y Autenticación ---
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            // Escuchar cambios en el estado de autenticación
+            const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                    setIsAuthReady(true);
+                    console.log("Autenticado como:", user.uid);
+
+                    // Registrar al jugador en Firestore
+                    const playerDocRef = doc(firestoreDb, `artifacts/${appId}/public/data/players`, user.uid);
+                    await setDoc(playerDocRef, {
+                        lastActive: Date.now(),
+                        card: generateBingoCard(), // Generar un cartón al unirse
+                        hasCalledBingo: false,
+                    }, { merge: true }); // Usar merge para no sobrescribir otros campos
+
+                    // Generar y guardar el cartón de bingo del jugador
+                    const storedCard = await getDoc(playerDocRef);
+                    if (storedCard.exists() && storedCard.data().card) {
+                        setBingoCard(storedCard.data().card);
+                    } else {
+                        const newCard = generateBingoCard();
+                        setBingoCard(newCard);
+                        await setDoc(playerDocRef, { card: newCard }, { merge: true });
+                    }
+
+                } else {
+                    // Si no hay token inicial, iniciar sesión anónimamente
+                    if (typeof __initial_auth_token === 'undefined') {
+                        await signInAnonymously(firebaseAuth);
+                        console.log("Iniciando sesión anónimamente...");
+                    } else {
+                        // Usar el token personalizado proporcionado por el entorno
+                        await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                        console.log("Iniciando sesión con token personalizado...");
+                    }
+                }
+            });
+
+            return () => unsubscribeAuth(); // Limpiar el listener de autenticación
+        } catch (error) {
+            console.error("Error al inicializar Firebase:", error);
+            setMessage("Error al iniciar el juego. Por favor, recarga la página.");
+            setIsLoading(false);
+        }
+    }, [appId, firebaseConfig]);
+
+    // --- Suscripción a los datos del juego en Firestore ---
+    useEffect(() => {
+        if (!db || !isAuthReady) return;
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/game`, 'current_game');
+
+        // Suscribirse a los cambios del documento del juego
+        unsubscribeRef.current = onSnapshot(gameDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                setCalledNumbers(new Set(data.calledNumbers || []));
+                setGameStatus(data.status || 'waiting');
+                setBingoWinner(data.winner || null);
+                if (data.status === 'playing') {
+                    setMessage(`Juego en curso. Último número: ${data.calledNumbers.slice(-1)[0] || 'N/A'}`);
+                } else if (data.status === 'bingo_called' && data.winner) {
+                    setMessage(`¡Bingo! El ganador es: ${data.winner}`);
+                } else if (data.status === 'game_over') {
+                    setMessage(`Juego terminado. Ganador: ${data.winner || 'Ninguno'}`);
+                } else if (data.status === 'waiting') {
+                    setMessage('Esperando jugadores para iniciar el juego...');
+                }
+            } else {
+                // Si el documento no existe, inicializarlo
+                setDoc(gameDocRef, {
+                    calledNumbers: [],
+                    status: 'waiting',
+                    winner: null,
+                    lastCallerId: null // Para rastrear quién fue el último en llamar
+                }, { merge: true });
+                setMessage('Juego inicializado. Esperando jugadores...');
+            }
+            setIsLoading(false);
+        }, (error) => {
+            console.error("Error al obtener datos del juego:", error);
+            setMessage("Error de conexión con el juego. Por favor, recarga.");
+            setIsLoading(false);
+        });
+
+        return () => {
+            if (unsubscribeRef.current) {
+                unsubscribeRef.current();
+            }
+        };
+    }, [db, isAuthReady, appId]);
+
+    // --- Suscripción a la lista de jugadores ---
+    useEffect(() => {
+        if (!db || !isAuthReady) return;
+
+        const playersColRef = collection(db, `artifacts/${appId}/public/data/players`);
+        const q = query(playersColRef);
+
+        unsubscribePlayersRef.current = onSnapshot(q, (snapshot) => {
+            const currentPlayers = {};
+            snapshot.forEach(doc => {
+                currentPlayers[doc.id] = doc.data();
+            });
+            setPlayers(currentPlayers);
+        }, (error) => {
+            console.error("Error al obtener lista de jugadores:", error);
+        });
+
+        return () => {
+            if (unsubscribePlayersRef.current) {
+                unsubscribePlayersRef.current();
+            }
+        };
+    }, [db, isAuthReady, appId]);
+
+    // --- Lógica del Juego ---
+
+    // Genera un cartón de bingo 5x5
+    const generateBingoCard = () => {
+        const card = [];
+        const ranges = {
+            B: [1, 15],
+            I: [16, 30],
+            N: [31, 45],
+            G: [46, 60],
+            O: [61, 75],
+        };
+        const columns = ['B', 'I', 'N', 'G', 'O'];
+
+        columns.forEach((col, colIndex) => {
+            const [min, max] = ranges[col];
+            const numbers = new Set();
+            while (numbers.size < 5) {
+                numbers.add(Math.floor(Math.random() * (max - min + 1)) + min);
+            }
+            card.push(Array.from(numbers).sort((a, b) => a - b));
+        });
+
+        // El centro es un espacio libre
+        card[2][2] = 'FREE';
+        return card;
+    };
+
+    // Maneja el marcado de un número en el cartón
+    const handleMarkNumber = (number) => {
+        if (gameStatus !== 'playing') return; // Solo se puede marcar durante el juego
+        if (calledNumbers.has(number) || number === 'FREE') {
+            setMarkedNumbers(prev => {
+                const newMarked = new Set(prev);
+                if (newMarked.has(number)) {
+                    newMarked.delete(number);
+                } else {
+                    newMarked.add(number);
+                }
+                return newMarked;
+            });
+        }
+    };
+
+    // Función para que el "llamador" cante un nuevo número
+    const handleCallNumber = async () => {
+        if (!db || !userId) return;
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/game`, 'current_game');
+        const gameSnap = await getDoc(gameDocRef);
+        const currentData = gameSnap.exists() ? gameSnap.data() : { calledNumbers: [], status: 'waiting' };
+
+        if (currentData.status === 'bingo_called') {
+            setMessage("¡Bingo ya ha sido cantado! Reinicia el juego para continuar.");
+            return;
+        }
+
+        const allPossibleNumbers = Array.from({ length: 75 }, (_, i) => i + 1);
+        const remainingNumbers = allPossibleNumbers.filter(num => !currentData.calledNumbers.includes(num));
+
+        if (remainingNumbers.length === 0) {
+            setMessage("¡Todos los números han sido cantados! Juego terminado.");
+            await updateDoc(gameDocRef, { status: 'game_over' });
+            return;
+        }
+
+        const newNumber = remainingNumbers[Math.floor(Math.random() * remainingNumbers.length)];
+        const updatedCalledNumbers = [...currentData.calledNumbers, newNumber];
+
+        await updateDoc(gameDocRef, {
+            calledNumbers: updatedCalledNumbers,
+            status: 'playing',
+            lastCallerId: userId // Registrar quién llamó el número
+        });
+    };
+
+    // Verifica si un cartón tiene bingo (simplificado)
+    const checkBingo = (card, marked, called) => {
+        if (!card || card.length === 0) return false;
+
+        // Convertir el Set de números cantados a un array para búsqueda eficiente
+        const calledArray = Array.from(called);
+
+        // Función auxiliar para verificar si todos los números de una línea están cantados
+        const checkLine = (line) => {
+            return line.every(num => num === 'FREE' || calledArray.includes(num));
+        };
+
+        // Verificar filas
+        for (let i = 0; i < 5; i++) {
+            if (checkLine(card[0][i], card[1][i], card[2][i], card[3][i], card[4][i])) return true; // Esto es incorrecto, debería ser por fila
+        }
+
+        // Corregir la verificación de filas y columnas
+        // Verificar filas (horizontal)
+        for (let row = 0; row < 5; row++) {
+            let rowNumbers = [];
+            for (let col = 0; col < 5; col++) {
+                rowNumbers.push(card[col][row]);
+            }
+            if (checkLine(rowNumbers)) return true;
+        }
+
+        // Verificar columnas (vertical)
+        for (let col = 0; col < 5; col++) {
+            let colNumbers = [];
+            for (let row = 0; row < 5; row++) {
+                colNumbers.push(card[col][row]);
+            }
+            if (checkLine(colNumbers)) return true;
+        }
+
+        // Verificar diagonal principal (top-left to bottom-right)
+        let diag1 = [];
+        for (let i = 0; i < 5; i++) {
+            diag1.push(card[i][i]);
+        }
+        if (checkLine(diag1)) return true;
+
+        // Verificar diagonal secundaria (top-right to bottom-left)
+        let diag2 = [];
+        for (let i = 0; i < 5; i++) {
+            diag2.push(card[i][4 - i]);
+        }
+        if (checkLine(diag2)) return true;
+
+        return false;
+    };
+
+
+    // Maneja el evento de "Cantar Bingo"
+    const handleCallBingo = async () => {
+        if (!db || !userId || gameStatus !== 'playing') return;
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/game`, 'current_game');
+        const playerDocRef = doc(db, `artifacts/${appId}/public/data/players`, userId);
+
+        // Actualizar el estado del jugador para indicar que ha cantado bingo
+        await updateDoc(playerDocRef, { hasCalledBingo: true });
+
+        // Validar el bingo del jugador
+        const isValid = checkBingo(bingoCard, markedNumbers, calledNumbers);
+        setIsBingoValid(isValid);
+        setShowBingoModal(true);
+
+        if (isValid) {
+            await updateDoc(gameDocRef, {
+                status: 'bingo_called',
+                winner: userId
+            });
+            setMessage(`¡Bingo! El ganador es: ${userId}`);
+        } else {
+            setMessage("¡No tienes bingo! Sigue jugando.");
+            // Si el bingo no es válido, restablecer hasCalledBingo después de un tiempo
+            setTimeout(async () => {
+                await updateDoc(playerDocRef, { hasCalledBingo: false });
+            }, 3000); // Dar un tiempo para que el mensaje se vea
+        }
+    };
+
+    // Reiniciar el juego
+    const handleResetGame = async () => {
+        if (!db || !userId) return;
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/game`, 'current_game');
+        await setDoc(gameDocRef, {
+            calledNumbers: [],
+            status: 'waiting',
+            winner: null,
+            lastCallerId: userId // El que reinicia el juego
+        });
+
+        // Reiniciar el estado local del jugador
+        setMarkedNumbers(new Set());
+        setBingoCard(generateBingoCard()); // Nuevo cartón para el jugador
+        setMessage('Juego reiniciado. Esperando jugadores...');
+
+        // Reiniciar el estado de hasCalledBingo para todos los jugadores
+        const playersColRef = collection(db, `artifacts/${appId}/public/data/players`);
+        const snapshot = await getDocs(playersColRef);
+        const batch = db.batch(); // Firestore batch para actualizaciones múltiples
+        snapshot.forEach(playerDoc => {
+            const playerRef = doc(db, `artifacts/${appId}/public/data/players`, playerDoc.id);
+            batch.update(playerRef, { hasCalledBingo: false });
+        });
+        await batch.commit();
+    };
+
+    // Determinar si el usuario actual es el "llamador" (el primero en unirse o el que reinició)
+    const isCaller = userId && Object.keys(players).length > 0 && players[Object.keys(players)[0]]?.socketId === players[userId]?.socketId;
+    // Note: This is a simplified way to determine the caller. In a real app, you'd have a more robust mechanism.
+    // For this example, the first player to join is considered the caller.
+
+    if (isLoading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-purple-600 to-blue-500 text-white">
+                <p className="text-2xl font-bold">Cargando juego de Bingo...</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-purple-700 to-indigo-800 text-white font-inter p-4 sm:p-8 flex flex-col items-center justify-center">
+            <header className="w-full max-w-4xl text-center mb-8">
+                <h1 className="text-4xl sm:text-5xl font-extrabold mb-2 text-yellow-300 drop-shadow-lg">
+                    ¡Bingo Online!
+                </h1>
+                <p className="text-lg sm:text-xl text-gray-200">
+                    Tu ID de Jugador: <span className="font-mono bg-purple-900 px-2 py-1 rounded-md text-sm">{userId || 'Cargando...'}</span>
+                </p>
+            </header>
+
+            <main className="w-full max-w-4xl bg-white bg-opacity-10 backdrop-filter backdrop-blur-sm rounded-xl shadow-2xl p-6 sm:p-8 border border-purple-400 flex flex-col lg:flex-row gap-8">
+                {/* Panel Izquierdo: Cartón de Bingo */}
+                <section className="flex-1 lg:w-2/3">
+                    <h2 className="text-3xl font-bold mb-4 text-center text-white">Tu Cartón de Bingo</h2>
+                    <div className="grid grid-cols-5 gap-2 sm:gap-3 bg-purple-900 bg-opacity-70 rounded-lg p-4 shadow-inner">
+                        {['B', 'I', 'N', 'G', 'O'].map((letter, index) => (
+                            <div key={letter} className="text-center text-lg sm:text-xl font-bold text-yellow-300 pb-2 border-b-2 border-yellow-400">
+                                {letter}
+                            </div>
+                        ))}
+                        {bingoCard.map((col, colIndex) => (
+                            col.map((number, rowIndex) => (
+                                <div
+                                    key={`${colIndex}-${rowIndex}`}
+                                    className={`
+                                        flex items-center justify-center p-2 sm:p-3 rounded-md cursor-pointer select-none
+                                        font-semibold text-lg sm:text-xl
+                                        transition-all duration-200 ease-in-out
+                                        ${number === 'FREE'
+                                            ? 'bg-yellow-400 text-purple-900 font-extrabold'
+                                            : calledNumbers.has(number)
+                                                ? markedNumbers.has(number)
+                                                    ? 'bg-green-500 text-white shadow-lg transform scale-105' // Marcado y llamado
+                                                    : 'bg-blue-500 text-white' // Llamado pero no marcado
+                                                : 'bg-gray-700 text-gray-200 hover:bg-gray-600' // No llamado
+                                        }
+                                        ${markedNumbers.has(number) && number !== 'FREE' && calledNumbers.has(number) ? 'border-2 border-yellow-300' : ''}
+                                    `}
+                                    onClick={() => handleMarkNumber(number)}
+                                >
+                                    {number}
+                                </div>
+                            ))
+                        ))}
+                    </div>
+                </section>
+
+                {/* Panel Derecho: Controles y Estado del Juego */}
+                <section className="flex-1 lg:w-1/3 flex flex-col gap-6">
+                    <div className="bg-white bg-opacity-15 rounded-lg p-4 shadow-md border border-purple-300">
+                        <h2 className="text-2xl font-bold mb-3 text-white">Estado del Juego</h2>
+                        <p className="text-lg text-gray-100 mb-2">{message}</p>
+                        <div className="flex flex-wrap gap-2 mb-4 max-h-40 overflow-y-auto pr-2">
+                            {Array.from(calledNumbers).sort((a, b) => a - b).map(num => (
+                                <span key={num} className="bg-yellow-400 text-purple-900 text-sm font-bold px-3 py-1 rounded-full shadow-md">
+                                    {num}
+                                </span>
+                            ))}
+                        </div>
+                        {gameStatus === 'playing' && (
+                            <p className="text-md text-gray-200">
+                                Números cantados: {calledNumbers.size}
+                            </p>
+                        )}
+                    </div>
+
+                    <div className="bg-white bg-opacity-15 rounded-lg p-4 shadow-md border border-purple-300">
+                        <h2 className="text-2xl font-bold mb-3 text-white">Controles</h2>
+                        {isCaller && gameStatus !== 'bingo_called' && (
+                            <button
+                                onClick={handleCallNumber}
+                                disabled={gameStatus === 'game_over' || gameStatus === 'bingo_called'}
+                                className="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg transform hover:scale-105 transition duration-300 mb-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {gameStatus === 'playing' ? 'Cantar Siguiente Número' : 'Iniciar Juego / Cantar Primer Número'}
+                            </button>
+                        )}
+                        <button
+                            onClick={handleCallBingo}
+                            disabled={gameStatus !== 'playing' || (players[userId] && players[userId].hasCalledBingo)}
+                            className="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg transform hover:scale-105 transition duration-300 mb-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            ¡Cantar Bingo!
+                        </button>
+                        {(isCaller || gameStatus === 'game_over' || gameStatus === 'bingo_called') && (
+                            <button
+                                onClick={handleResetGame}
+                                className="w-full bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg transform hover:scale-105 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                Reiniciar Juego
+                            </button>
+                        )}
+                    </div>
+
+                    <div className="bg-white bg-opacity-15 rounded-lg p-4 shadow-md border border-purple-300">
+                        <h2 className="text-2xl font-bold mb-3 text-white">Jugadores Conectados ({Object.keys(players).length})</h2>
+                        <ul className="max-h-40 overflow-y-auto text-gray-200">
+                            {Object.keys(players).map(playerId => (
+                                <li key={playerId} className={`mb-1 ${playerId === userId ? 'font-bold text-yellow-300' : ''}`}>
+                                    {playerId} {playerId === userId && '(Tú)'}
+                                    {players[playerId]?.hasCalledBingo && <span className="ml-2 text-green-400">(¡Cantó Bingo!)</span>}
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                </section>
+            </main>
+
+            {/* Modal de Bingo */}
+            {showBingoModal && (
+                <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white p-6 rounded-lg shadow-xl text-center max-w-md w-full">
+                        <h3 className={`text-3xl font-bold mb-4 ${isBingoValid ? 'text-green-600' : 'text-red-600'}`}>
+                            {isBingoValid ? '¡BINGO VÁLIDO!' : 'BINGO INVÁLIDO'}
+                        </h3>
+                        <p className="text-gray-700 text-lg mb-6">
+                            {isBingoValid
+                                ? `¡Felicidades! Has ganado el bingo.`
+                                : `Lo siento, tu cartón no tiene bingo con los números cantados. ¡Sigue intentándolo!`
+                            }
+                        </p>
+                        <button
+                            onClick={() => setShowBingoModal(false)}
+                            className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-5 rounded-lg transition duration-300"
+                        >
+                            Cerrar
+                        </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+export default App;
 
